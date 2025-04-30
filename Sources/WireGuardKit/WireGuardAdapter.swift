@@ -26,14 +26,14 @@ public enum WireGuardAdapterError: Error {
     case startWireGuardBackend(Int32)
 }
 
-private enum WireGuardGoState: Int32, CustomStringConvertible {
+public enum WireGuardGoState: Int32, CustomStringConvertible {
     case disabled = 0
     case connecting
     case connected
     case error
     case waitingForNetwork
 
-    var description: String {
+    public var description: String {
         switch self {
             case .disabled:
                 return "Disabled"
@@ -80,6 +80,8 @@ private enum State {
 }
 
 public class WireGuardAdapter: NSObject {
+    public static let wireguardStateDidChangeNotification = NSNotification.Name("WireGuardStateDidChange")
+
     public typealias LogHandler = (WireGuardLogLevel, String) -> Void
 
     /// Packet tunnel provider.
@@ -99,6 +101,13 @@ public class WireGuardAdapter: NSObject {
 
     /// Adapter state.
     private var state: State = .stopped
+
+    /// WireGuardKitGo state.
+    private var tunnelState: WireGuardGoState = .disabled {
+        didSet {
+            NotificationCenter.default.post(name: Self.wireguardStateDidChangeNotification, object: tunnelState)
+        }
+    }
 
     private var socketType: String = "udp" {
         didSet {
@@ -224,13 +233,19 @@ public class WireGuardAdapter: NSObject {
 
             var previousState: WireGuardGoState? = nil
             while let handle = self.state.handle,
-                  // `wgGetState(_:)` is a blocking call, and will only unblock when the state changes.
-                  let goState = WireGuardGoState(rawValue: wgGetState(handle)) {
+                // `wgGetState(_:)` is a blocking call, and will only unblock when the state changes.
+                let goState = WireGuardGoState(rawValue: wgGetState(handle)) {
 
-                if previousState != goState {
-                    self.logHandler(.verbose, "WireGuardKitGo state change \(previousState?.description ?? "(nil)") --> \(goState.description)")
+                guard previousState != goState else {
+                    return
                 }
+
+                self.logHandler(.verbose, "WireGuardKitGo state change \(previousState?.description ?? "(nil)") --> \(goState.description)")
+
                 previousState = goState
+                workQueue.async {
+                    self.tunnelState = goState
+                }
             }
             self.logHandler(.verbose, "Exiting state change observation loop.")
         }
