@@ -4,21 +4,22 @@
 import Foundation
 import Network
 
-public enum DNSTransport {
+public enum DNSTransport: Equatable {
     case classic
-    case https
+    case https(path: String?)
     case tls
 }
 
 extension DNSTransport {
-    static func transport(from stringValue: some StringProtocol) -> DNSTransport? {
-        switch stringValue {
+    static func transport(from url: URL) -> DNSTransport {
+        switch url.scheme {
         case "https":
-            return .https
+            let path = url.path()
+            return .https(path: path.isEmpty ? nil : path)
         case "tls":
             return .tls
         default:
-            return nil
+            return .classic
         }
     }
 }
@@ -42,29 +43,22 @@ extension DNSServer: Equatable {
 extension DNSServer {
     public var stringRepresentation: String {
         switch transport {
-        case .https:
-            return "https://\(address)/dns-query"
+        case .https(let path?):
+            return "https://\(address)\(path)"
+        case .https(nil):
+            return "https://\(address)"
         case .tls, .classic:
             return "\(address)"
         }
     }
 
     public init?(from addressString: String) {
-        let host: String
-        let transport: DNSTransport
-        if #available(iOS 16.0, macOS 13.0, *) {
-            let components = addressString.split(separator: "://")
-            if components.count > 1 {
-                host = String(components[1])
-                transport = DNSTransport.transport(from: components[0]) ?? .classic
-            } else {
-                host = String(components[0])
-                transport = .classic
-            }
-        } else {
-            host = addressString
-            transport = .classic
+        guard let url = URL(string: addressString), let host = url.host() else {
+            return nil
         }
+
+        let transport = DNSTransport.transport(from: url)
+
         if let addr = IPv4Address(host) {
             self.address = addr
             self.transport = transport

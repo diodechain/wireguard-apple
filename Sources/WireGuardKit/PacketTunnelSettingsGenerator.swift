@@ -76,32 +76,19 @@ final class PacketTunnelSettingsGenerator {
 
     func appropriateDNSSettings() -> NEDNSSettings {
         // When using DoH/DoT, it seems we can only set one serverName/serverURL
+        // So for now, we would expect that DNS resolvers are sorted by transport so TLS/HTTPS related entries would be first.
         let firstElement = tunnelConfiguration.interface.dns[0]
         switch firstElement.transport {
         case .tls:
-            if #available(iOS 14.0, macOS 11.0, *) {
-                let dnsSettings = NEDNSOverTLSSettings()
-                dnsSettings.serverName = firstElement.stringRepresentation
-                return dnsSettings
-            } else {
-                fallthrough
-            }
+            let dnsSettings = NEDNSOverTLSSettings()
+            dnsSettings.serverName = firstElement.stringRepresentation
+            return dnsSettings
         case .https:
-            if #available(iOS 14.0, macOS 11.0, *) {
-                let dnsSettings = NEDNSOverHTTPSSettings()
-                dnsSettings.serverURL = URL(string: firstElement.stringRepresentation)!
-                return dnsSettings
-            } else {
-                fallthrough
-            }
+            let dnsSettings = NEDNSOverHTTPSSettings()
+            dnsSettings.serverURL = URL(string: firstElement.stringRepresentation)!
+            return dnsSettings
         case .classic:
-            let servers: [String]
-            if case .classic = firstElement.transport {
-                servers = tunnelConfiguration.interface.dns.map { $0.stringRepresentation }
-            } else {
-                servers = tunnelConfiguration.interface.dns[1...].map { $0.stringRepresentation }
-            }
-            return NEDNSSettings(servers: servers)
+            return NEDNSSettings(servers: tunnelConfiguration.interface.dns.map { $0.stringRepresentation })
         }
     }
 
@@ -113,7 +100,7 @@ final class PacketTunnelSettingsGenerator {
         let dnsSettings: NEDNSSettings = appropriateDNSSettings()
 
         if !tunnelConfiguration.interface.dns.isEmpty {
-            dnsSettings.matchDomains = [""] // All DNS queries must first go through the tunnel's DNS
+            dnsSettings.matchDomains = [""] // Direct **all** DNS queries to user's DNS settings
         }
 
         dnsSettings.searchDomains = tunnelConfiguration.interface.dnsSearch
