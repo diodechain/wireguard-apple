@@ -12,7 +12,7 @@ import WireGuardKitC
 /// A type alias for `Result` type that holds a tuple with source and resolved endpoint.
 typealias EndpointResolutionResult = Result<(Endpoint, Endpoint), DNSResolutionError>
 
-class PacketTunnelSettingsGenerator {
+final class PacketTunnelSettingsGenerator {
     let tunnelConfiguration: TunnelConfiguration
     let resolvedEndpoints: [Endpoint?]
 
@@ -74,6 +74,40 @@ class PacketTunnelSettingsGenerator {
         return (wgSettings, resolutionResults)
     }
 
+    func appropriateDNSSettings() -> NEDNSSettings {
+        // When using DoH/DoT, it seems we can only set one serverName/serverURL
+        // So for now, we would expect that DNS resolvers are sorted by transport so TLS/HTTPS related entries would be first.
+        let firstElement = tunnelConfiguration.interface.dns[0]
+        switch firstElement.transport {
+        case .tls:
+            let dnsSettings = NEDNSOverTLSSettings()
+            dnsSettings.serverName = firstElement.stringRepresentation
+            return dnsSettings
+        case .https:
+            let dnsSettings = NEDNSOverHTTPSSettings()
+            dnsSettings.serverURL = URL(string: firstElement.stringRepresentation)!
+            return dnsSettings
+        case .classic:
+            return NEDNSSettings(servers: tunnelConfiguration.interface.dns.map { $0.stringRepresentation })
+        }
+    }
+
+    func setDNSSettings(to networkSettings: NEPacketTunnelNetworkSettings) {
+        guard !tunnelConfiguration.interface.dnsSearch.isEmpty || !tunnelConfiguration.interface.dns.isEmpty else {
+            return
+        }
+
+        let dnsSettings: NEDNSSettings = appropriateDNSSettings()
+
+        if !tunnelConfiguration.interface.dns.isEmpty {
+            dnsSettings.matchDomains = [""] // Direct **all** DNS queries to user's DNS settings
+        }
+
+        dnsSettings.searchDomains = tunnelConfiguration.interface.dnsSearch
+
+        networkSettings.dnsSettings = dnsSettings
+    }
+
     func generateNetworkSettings() -> NEPacketTunnelNetworkSettings {
         /* iOS requires a tunnel endpoint, whereas in WireGuard it's valid for
          * a tunnel to have no endpoint, or for there to be many endpoints, in
@@ -83,15 +117,7 @@ class PacketTunnelSettingsGenerator {
          */
         let networkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
 
-        if !tunnelConfiguration.interface.dnsSearch.isEmpty || !tunnelConfiguration.interface.dns.isEmpty {
-            let dnsServerStrings = tunnelConfiguration.interface.dns.map { $0.stringRepresentation }
-            let dnsSettings = NEDNSSettings(servers: dnsServerStrings)
-            dnsSettings.searchDomains = tunnelConfiguration.interface.dnsSearch
-            if !tunnelConfiguration.interface.dns.isEmpty {
-                dnsSettings.matchDomains = [""] // All DNS queries must first go through the tunnel's DNS
-            }
-            networkSettings.dnsSettings = dnsSettings
-        }
+        setDNSSettings(to: networkSettings)
 
         let mtu = tunnelConfiguration.interface.mtu ?? 0
 
