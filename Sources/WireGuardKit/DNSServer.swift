@@ -53,11 +53,12 @@ extension DNSServer {
     }
 
     public init?(from addressString: String) {
-        guard let url = URL(string: addressString), let host = url.host() else {
+        guard let url = URL(string: addressString) else {
             return nil
         }
 
         let transport = DNSTransport.transport(from: url)
+        let host = url.host() ?? addressString
 
         if let addr = IPv4Address(host) {
             self.address = addr
