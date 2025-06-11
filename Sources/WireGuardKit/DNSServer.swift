@@ -58,7 +58,13 @@ extension DNSServer {
         }
 
         let transport = DNSTransport.transport(from: url)
-        let host = url.host() ?? addressString
+
+        let host: String
+        if #available(iOS 16.7, macOS 13.7, *) {
+            host = url.host() ?? addressString
+        } else {
+            host = url.host ?? addressString
+        }
 
         if let addr = IPv4Address(host) {
             self.address = addr
