@@ -15,10 +15,12 @@ typealias EndpointResolutionResult = Result<(Endpoint, Endpoint), DNSResolutionE
 final class PacketTunnelSettingsGenerator {
     let tunnelConfiguration: TunnelConfiguration
     let resolvedEndpoints: [Endpoint?]
+    let providerConfiguration: [String: Any]?
 
-    init(tunnelConfiguration: TunnelConfiguration, resolvedEndpoints: [Endpoint?]) {
+    init(tunnelConfiguration: TunnelConfiguration, resolvedEndpoints: [Endpoint?], providerConfiguration: [String: Any]? = nil) {
         self.tunnelConfiguration = tunnelConfiguration
         self.resolvedEndpoints = resolvedEndpoints
+        self.providerConfiguration = providerConfiguration
     }
 
     func endpointUapiConfiguration() -> (String, [EndpointResolutionResult?]) {
@@ -144,14 +146,42 @@ final class PacketTunnelSettingsGenerator {
 
         let ipv4Settings = NEIPv4Settings(addresses: ipv4Addresses.map { $0.destinationAddress }, subnetMasks: ipv4Addresses.map { $0.destinationSubnetMask })
         ipv4Settings.includedRoutes = ipv4IncludedRoutes
+        
+        // Add excluded routes if traffic capture is disabled
+        if !captureTrafficAutomatically {
+            ipv4Settings.excludedRoutes = [NEIPv4Route.default()]
+        }
+        
         networkSettings.ipv4Settings = ipv4Settings
 
         let ipv6Settings = NEIPv6Settings(addresses: ipv6Addresses.map { $0.destinationAddress }, networkPrefixLengths: ipv6Addresses.map { $0.destinationNetworkPrefixLength })
         ipv6Settings.includedRoutes = ipv6IncludedRoutes
+
+        // Add excluded routes if traffic capture is disabled
+        if !captureTrafficAutomatically {
+            ipv6Settings.excludedRoutes = [NEIPv6Route.default()]
+        }
+        
         networkSettings.ipv6Settings = ipv6Settings
 
         return networkSettings
     }
+
+    // Tunnel will be capturing all network traffic automatically unless specified in the providerConfiguration.
+    private lazy var captureTrafficAutomatically: Bool = {
+        guard let captureValue = providerConfiguration?["captureTrafficAutomatically"] else {
+            return true
+        }
+
+        switch captureValue {
+        case let value as Bool:
+            return value
+        case let value as NSNumber:
+            return value.boolValue
+        default:
+            return true
+        }
+    }()
 
     private func addresses() -> ([NEIPv4Route], [NEIPv6Route]) {
         var ipv4Routes = [NEIPv4Route]()
@@ -172,6 +202,7 @@ final class PacketTunnelSettingsGenerator {
     }
 
     private func includedRoutes() -> ([NEIPv4Route], [NEIPv6Route]) {
+
         var ipv4IncludedRoutes = [NEIPv4Route]()
         var ipv6IncludedRoutes = [NEIPv6Route]()
 
@@ -187,12 +218,43 @@ final class PacketTunnelSettingsGenerator {
             }
         }
 
-        for peer in tunnelConfiguration.peers {
-            for addressRange in peer.allowedIPs {
-                if addressRange.address is IPv4Address {
-                    ipv4IncludedRoutes.append(NEIPv4Route(destinationAddress: "\(addressRange.address)", subnetMask: "\(addressRange.subnetMask())"))
-                } else if addressRange.address is IPv6Address {
-                    ipv6IncludedRoutes.append(NEIPv6Route(destinationAddress: "\(addressRange.address)", networkPrefixLength: NSNumber(value: addressRange.networkPrefixLength)))
+        // Add LocalAgent route
+        ipv4IncludedRoutes.append(NEIPv4Route.localAgentRoute)
+
+        if captureTrafficAutomatically {
+            // Capturing all traffic automatically
+            // Add routes to all peer allowedIPs
+            for peer in tunnelConfiguration.peers {
+                for addressRange in peer.allowedIPs {
+                    if addressRange.address is IPv4Address {
+                        ipv4IncludedRoutes.append(NEIPv4Route(destinationAddress: "\(addressRange.address)", subnetMask: "\(addressRange.subnetMask())"))
+                    } else if addressRange.address is IPv6Address {
+                        ipv6IncludedRoutes.append(NEIPv6Route(destinationAddress: "\(addressRange.address)", networkPrefixLength: NSNumber(value: addressRange.networkPrefixLength)))
+                    }
+                }
+            }
+        } else {
+            // Capturing only essential traffic automatically
+            // Add routes to WireGuard server endpoints
+            for peer in tunnelConfiguration.peers {
+                if let endpoint = peer.endpoint {
+                    switch endpoint.host {
+                    case .ipv4(let address):
+                        ipv4IncludedRoutes.append(NEIPv4Route(destinationAddress: "\(address)", subnetMask: "255.255.255.255"))
+                    case .ipv6(let address):
+                        ipv6IncludedRoutes.append(NEIPv6Route(destinationAddress: "\(address)", networkPrefixLength: NSNumber(value: 128)))
+                    default:
+                        break
+                    }
+                }
+            }
+
+            // Add routes to DNS servers
+            for dnsServer in tunnelConfiguration.interface.dns {
+                if dnsServer.address is IPv4Address {
+                    ipv4IncludedRoutes.append(NEIPv4Route(destinationAddress: "\(dnsServer.address)", subnetMask: "255.255.255.255"))
+                } else if dnsServer.address is IPv6Address {
+                    ipv6IncludedRoutes.append(NEIPv6Route(destinationAddress: "\(dnsServer.address)", networkPrefixLength: NSNumber(value: 128)))
                 }
             }
         }
@@ -205,5 +267,11 @@ final class PacketTunnelSettingsGenerator {
                 // swiftlint:disable:next force_cast
                 return error as! DNSResolutionError
             }
+    }
+}
+
+extension NEIPv4Route {
+    static var localAgentRoute: NEIPv4Route {
+        return NEIPv4Route(destinationAddress: "10.2.0.1", subnetMask: "255.255.255.255")
     }
 }

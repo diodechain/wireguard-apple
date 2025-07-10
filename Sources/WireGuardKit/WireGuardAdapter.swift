@@ -476,9 +476,11 @@ public class WireGuardAdapter: NSObject {
     /// - Throws: an error of type `WireGuardAdapterError`.
     /// - Returns: an instance of type `PacketTunnelSettingsGenerator`.
     private func makeSettingsGenerator(with tunnelConfiguration: TunnelConfiguration) throws -> PacketTunnelSettingsGenerator {
+        let providerConfiguration = (packetTunnelProvider?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
         return PacketTunnelSettingsGenerator(
             tunnelConfiguration: tunnelConfiguration,
-            resolvedEndpoints: try self.resolvePeers(for: tunnelConfiguration)
+            resolvedEndpoints: try self.resolvePeers(for: tunnelConfiguration),
+            providerConfiguration: providerConfiguration
         )
     }
 
