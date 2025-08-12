@@ -3,7 +3,7 @@
 
 import Foundation
 
-extension Array {
+public extension Array {
 
     /// Returns an array containing the results of mapping the given closure over the sequence’s
     /// elements concurrently.

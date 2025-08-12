@@ -7,6 +7,7 @@ import NetworkExtension
 #if SWIFT_PACKAGE
 import WireGuardKitGo
 import WireGuardKitC
+@_exported import WireGuardKitSupport
 #endif
 
 public enum WireGuardAdapterError: Error {
@@ -49,46 +50,33 @@ public enum WireGuardGoState: Int32, CustomStringConvertible {
     }
 }
 
+private struct WireGuardBridgeState {
+    let handle: Int32
+    let settingsGenerator: PacketTunnelSettingsGenerator
+}
+
 /// Enum representing internal state of the `WireGuardAdapter`
-private enum State {
+@objc public enum WireGuardTunnelState: Int {
     /// The tunnel is stopped
     case stopped
 
     /// The tunnel is up and running
-    case started(_ handle: Int32, _ settingsGenerator: PacketTunnelSettingsGenerator)
+    case started
 
     /// The tunnel is temporarily shutdown due to device going offline
-    case temporaryShutdown(_ handle: Int32, _ settingsGenerator: PacketTunnelSettingsGenerator)
-
-    var handle: Int32? {
-        switch self {
-            case .stopped:
-                return nil
-            case let .temporaryShutdown(handle, _), let .started(handle, _):
-                return handle
-        }
-    }
-
-    var settingsGenerator: PacketTunnelSettingsGenerator? { 
-        switch self {
-            case .stopped:
-                return nil
-            case let .temporaryShutdown(_, settingsGenerator), let .started(_, settingsGenerator):
-                return settingsGenerator
-        }
-    }
+    case temporaryShutdown
 }
 
 public class WireGuardAdapter: NSObject {
-    public static let wireguardStateDidChangeNotification = NSNotification.Name("WireGuardStateDidChange")
+    private static let networkPathUpdateDebounceInterval: Duration = .milliseconds(100)
+    private static let networkPathUpdateDebounceTolerance: Duration = .milliseconds(50)
 
     public typealias LogHandler = (WireGuardLogLevel, String) -> Void
 
     /// Packet tunnel provider.
     @objc private weak var packetTunnelProvider: NEPacketTunnelProvider?
 
-    /// Used for observing changes in the network path.
-    private var pathUpdateObservation: NSKeyValueObservation!
+    private var pathUpdateObserverTask: Task<Void, Error>?
 
     /// Log handler closure.
     private let logHandler: LogHandler
@@ -99,15 +87,14 @@ public class WireGuardAdapter: NSObject {
     /// Private queue used for observing state changes by the backend.
     private let stateChangeQueue = DispatchQueue(label: "WireGuardAdapterStateChangeQueue")
 
-    /// Adapter state.
-    private var state: State = .stopped
+    /// Tunnel state. Public so that consumers can see when the tunnel has temporarily stopped for the network.
+    @objc public private(set) dynamic var state: WireGuardTunnelState = .stopped
+
+    /// Bridge state to WireGuardKitGo. Equal to `nil` when `state` == `.stopped`.
+    private var bridgeState: WireGuardBridgeState?
 
     /// WireGuardKitGo state.
-    private var tunnelState: WireGuardGoState = .disabled {
-        didSet {
-            NotificationCenter.default.post(name: Self.wireguardStateDidChangeNotification, object: tunnelState)
-        }
-    }
+    private var goState: WireGuardGoState = .disabled
 
     private var socketType: String = "udp" {
         didSet {
@@ -202,7 +189,7 @@ public class WireGuardAdapter: NSObject {
         wgSetLogger(nil, nil)
 
         // Shutdown the tunnel
-        if case .started(let handle, _) = self.state {
+        if case .started = self.state, let handle = bridgeState?.handle {
             wgTurnOff(handle)
         }
     }
@@ -213,7 +200,7 @@ public class WireGuardAdapter: NSObject {
     /// - Parameter completionHandler: completion handler.
     public func getRuntimeConfiguration(completionHandler: @escaping (String?) -> Void) {
         workQueue.async {
-            guard case .started(let handle, _) = self.state else {
+            guard let handle = self.bridgeState?.handle else {
                 completionHandler(nil)
                 return
             }
@@ -232,7 +219,7 @@ public class WireGuardAdapter: NSObject {
             guard let `self` = self else { return }
 
             var previousState: WireGuardGoState? = nil
-            while let handle = self.state.handle,
+            while let handle = self.bridgeState?.handle,
                 // `wgGetState(_:)` is a blocking call, and will only unblock when the state changes.
                 let goState = WireGuardGoState(rawValue: wgGetState(handle)) {
 
@@ -244,10 +231,37 @@ public class WireGuardAdapter: NSObject {
 
                 previousState = goState
                 workQueue.async {
-                    self.tunnelState = goState
+                    self.goState = goState
                 }
             }
             self.logHandler(.verbose, "Exiting state change observation loop.")
+        }
+    }
+
+    public func observeNetworkPathChanges() {
+        let observationStream: AsyncStream<(NWPath?, NWPath?)> = AsyncStream(NWPath?.self, { continuation in
+            let observation = self.observe(\.packetTunnelProvider?.defaultPath, options: [.old, .new]) {
+                guard let path = $1.newValue else {
+                    continuation.finish()
+                    return
+                }
+                continuation.yield(path)
+            }
+
+            continuation.onTermination = { _ in
+                observation.invalidate()
+            }
+        })
+        .debounce(interval: Self.networkPathUpdateDebounceInterval, tolerance: Self.networkPathUpdateDebounceTolerance)
+        .scan((nil, nil)) { accumulatedResult, path in
+            (accumulatedResult.1, path)
+        }
+
+        self.pathUpdateObserverTask = Task { [weak self] in
+            for await (oldPath, path) in observationStream {
+                try Task.checkCancellation()
+                self?.didReceivePathUpdate(from: oldPath, to: path)
+            }
         }
     }
 
@@ -255,7 +269,11 @@ public class WireGuardAdapter: NSObject {
     /// - Parameters:
     ///   - tunnelConfiguration: tunnel configuration.
     ///   - completionHandler: completion handler.
-    public func start(tunnelConfiguration: TunnelConfiguration, socketType: String, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+    public func start(
+        tunnelConfiguration: TunnelConfiguration,
+        socketType: String,
+        completionHandler: @escaping (WireGuardAdapterError?) -> Void
+    ) {
         workQueue.async {
             guard case .stopped = self.state else {
                 completionHandler(.invalidState)
@@ -263,16 +281,7 @@ public class WireGuardAdapter: NSObject {
             }
 
             self.socketType = socketType
-            self.pathUpdateObservation = self.observe(\.packetTunnelProvider?.defaultPath, options: [.old, .new]) { [weak self] _, change in
-                guard let new = change.newValue,
-                      new == nil ||
-                      change.oldValue == nil ||
-                      change.oldValue! == nil ||
-                      !new!.isEqual(to: change.oldValue!!) else {
-                    return
-                }
-                self?.didReceivePathUpdate(path: new)
-            }
+            self.observeNetworkPathChanges()
 
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
@@ -281,15 +290,17 @@ public class WireGuardAdapter: NSObject {
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
-                self.state = .started(
-                    try self.startWireGuardBackend(wgConfig: wgConfig),
-                    settingsGenerator
-                )
+                let handle = try self.startWireGuardBackend(wgConfig: wgConfig)
+                self.bridgeState = .init(handle: handle, settingsGenerator: settingsGenerator)
+                self.state = .started
+
+                wgSetNetworkAvailable(handle, 1)
 
                 self.observeStateChanges()
                 completionHandler(nil)
             } catch let error as WireGuardAdapterError {
-                self.pathUpdateObservation?.invalidate()
+                self.pathUpdateObserverTask?.cancel()
+                self.pathUpdateObserverTask = nil
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -301,20 +312,15 @@ public class WireGuardAdapter: NSObject {
     /// - Parameter completionHandler: completion handler.
     public func stop(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
-            switch self.state {
-            case .started(let handle, _):
-                wgTurnOff(handle)
-
-            case .temporaryShutdown:
-                break
-
-            case .stopped:
+            guard let handle = self.bridgeState?.handle else {
                 completionHandler(.invalidState)
                 return
             }
 
-            self.pathUpdateObservation?.invalidate()
-            self.pathUpdateObservation = nil
+            wgTurnOff(handle)
+
+            self.pathUpdateObserverTask?.cancel()
+            self.pathUpdateObserverTask = nil
 
             self.state = .stopped
 
@@ -346,7 +352,12 @@ public class WireGuardAdapter: NSObject {
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
 
                 switch self.state {
-                case .started(let handle, _):
+                case .started:
+                    guard let handle = self.bridgeState?.handle else {
+                        assertionFailure("Should have handle with state == .started")
+                        return
+                    }
+
                     let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                     self.logEndpointResolutionResults(resolutionResults)
 
@@ -355,10 +366,14 @@ public class WireGuardAdapter: NSObject {
                     wgDisableSomeRoamingForBrokenMobileSemantics(handle)
                     #endif
 
-                    self.state = .started(handle, settingsGenerator)
+                    self.state = .started
+                case .temporaryShutdown:
+                    guard let handle = self.bridgeState?.handle else {
+                        assertionFailure("Should have handle with state == .temporaryShutdown")
+                        return
+                    }
 
-                case .temporaryShutdown(let handle, _):
-                    self.state = .temporaryShutdown(handle, settingsGenerator)
+                    self.bridgeState = .init(handle: handle, settingsGenerator: settingsGenerator)
 
                 case .stopped:
                     fatalError()
@@ -503,48 +518,34 @@ public class WireGuardAdapter: NSObject {
 
     /// Helper method used by network path monitor.
     /// - Parameter path: new network path
-    private func didReceivePathUpdate(path: NetworkExtension.NWPath?) {
-        self.logHandler(.verbose, path?.pathUpdateDescription ?? "Network went offline.")
+    private func didReceivePathUpdate(from oldPath: NetworkExtension.NWPath?, to path: NetworkExtension.NWPath?) {
+        self.logHandler(.verbose, "NWPath: \(optional: oldPath) --> \(optional: path)")
 
-        switch self.state {
-        case .started(let handle, let settingsGenerator):
-            guard let path, path.status.isSatisfiable else {
-                self.logHandler(.verbose, "Connectivity offline, pausing backend.")
-                self.state = .temporaryShutdown(handle, settingsGenerator)
-                wgSetNetworkAvailable(handle, 0)
-                return
-            }
+        guard let handle = bridgeState?.handle else {
+            self.logHandler(.error, "Received path update while tunnel stopped. Ignoring.")
+            return
+        }
 
-            let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
-            self.logEndpointResolutionResults(resolutionResults)
+        switch (oldPath?.status, path?.status) {
+        case (_, nil), (_, .unsatisfied), (_, .invalid):
+            // Transition from any state to invalid or unsatisfied: pause the tunnel, if it isn't already.
+            self.logHandler(.verbose, "NWPathMonitor: Connectivity offline, pausing backend.")
+            self.state = .temporaryShutdown
+            wgSetNetworkAvailable(handle, 0)
 
-            wgSetConfig(handle, wgConfig)
+        case (.satisfiable, .satisfied):
+            // If we've observed the transition to `satisfiable`, we should have already restarted the tunnel.
+            assert(self.state == .started, "Tunnel state should be .started after transition from .satisfiable")
+            self.logHandler(.verbose, "NWPathMonitor: ignoring satisfiable -> satisfied transition.")
 
-            #if os(iOS)
-            wgDisableSomeRoamingForBrokenMobileSemantics(handle)
-            #endif
+        default:
+            // Any transition not from `.unsatisfied` to another `.unsatisfied` or `.invalid` state should result in us
+            // poking the tunnel to make sure it's still ready.
 
+            self.logHandler(.verbose, "NWPathMonitor: bumping tunnel.")
+            self.state = .started
             wgSetNetworkAvailable(handle, 1)
             wgBumpSockets(handle)
-
-        case let .temporaryShutdown(handle, settingsGenerator):
-            guard let path, path.status.isSatisfiable else {
-                self.logHandler(.verbose, "Connectivity still offline.")
-                return
-            }
-
-            self.logHandler(.verbose, "Connectivity online, resuming backend.")
-
-            wgSetNetworkAvailable(handle, 1)
-
-            self.state = .started(
-                handle,
-                settingsGenerator
-            )
-
-        case .stopped:
-            // no-op
-            break
         }
     }
 }
@@ -555,17 +556,7 @@ public enum WireGuardLogLevel: Int32 {
     case error = 1
 }
 
-private extension NetworkExtension.NWPath {
-    var pathUpdateDescription: String {
-        var result = "Network change detected with \(status). isExpensive: \(isExpensive)"
-        if #available(iOS 13, macOS 10.15, *) {
-            result += " isConstrained: \(isConstrained)"
-        }
-        return result
-    }
-}
-
-extension NetworkExtension.NWPathStatus: CustomStringConvertible {
+extension NetworkExtension.NWPathStatus: @retroactive CustomStringConvertible {
     public var description: String {
         switch self {
         case .satisfiable:

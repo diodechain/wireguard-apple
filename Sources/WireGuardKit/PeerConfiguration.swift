@@ -3,6 +3,8 @@
 
 import Foundation
 
+import WireGuardKitSupport
+
 public struct PeerConfiguration {
     public var publicKey: PublicKey
     public var preSharedKey: PreSharedKey?
