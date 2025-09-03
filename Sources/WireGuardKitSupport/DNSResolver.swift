@@ -4,9 +4,9 @@
 import Network
 import Foundation
 
-enum DNSResolver {}
+package enum DNSResolver {}
 
-extension DNSResolver {
+package extension DNSResolver {
 
     /// Concurrent queue used for DNS resolutions
     private static let resolverQueue = DispatchQueue(label: "DNSResolverQueue", qos: .default, attributes: .concurrent)
@@ -90,7 +90,7 @@ extension DNSResolver {
     }
 }
 
-extension Endpoint {
+public extension Endpoint {
     func withReresolvedIP() throws -> Endpoint {
         #if os(iOS) || os(tvOS)
         let hostname: String

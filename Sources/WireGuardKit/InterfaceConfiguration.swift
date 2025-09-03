@@ -4,6 +4,8 @@
 import Foundation
 import Network
 
+import WireGuardKitSupport
+
 public struct InterfaceConfiguration {
     public var privateKey: PrivateKey
     public var addresses = [IPAddressRange]()
