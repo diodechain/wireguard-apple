@@ -530,6 +530,7 @@ public class WireGuardAdapter: NSObject {
         case (_, nil), (_, .unsatisfied), (_, .invalid):
             // Transition from any state to invalid or unsatisfied: pause the tunnel, if it isn't already.
             self.logHandler(.verbose, "NWPathMonitor: Connectivity offline, pausing backend.")
+            self.packetTunnelProvider?.reasserting = true
             self.state = .temporaryShutdown
             wgSetNetworkAvailable(handle, 0)
 
@@ -543,9 +544,11 @@ public class WireGuardAdapter: NSObject {
             // poking the tunnel to make sure it's still ready.
 
             self.logHandler(.verbose, "NWPathMonitor: bumping tunnel.")
+
             self.state = .started
             wgSetNetworkAvailable(handle, 1)
             wgBumpSockets(handle)
+            self.packetTunnelProvider?.reasserting = false
         }
     }
 }
